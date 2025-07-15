@@ -33,3 +33,5 @@ $RECYCLE.BIN/
 creds.txt
 credentials.txt
 creds/
+*.ipynb
+.venv

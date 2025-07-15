@@ -7,85 +7,127 @@ Author: Primus27
 # Import packages
 import os
 import argparse
+import re
 from pathlib import Path
-from title_generator import TitleGen
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime
+
+import ezodf
+import openpyxl
+import pandas as pd
+from docx import Document
 
 # Current program version
-current_version = 1.3
+current_version = 2
+
+@dataclass
+class SearchParameters:
+    username_pattern: Optional[re.Pattern]
+    password_pattern: Optional[re.Pattern]
+    other_keyword_pattern: Optional[re.Pattern]
+
+TODAY = datetime.now()
 
 
-def extract_kw(line):
-    """
-    Takes string and extracts the keyword.
-    E.g. 'Password: 123' returns '123'
-    :param line: Line to extract.
-    :return: Keyword found after the colon punctuation mark.
-    """
-    return (line.split(":")[-1]).replace("\n", "").replace(" ", "")
+def get_lines(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
 
-
-def list_lower(mixed_list):
-    """
-    Converts list element in a list to lowercase.
-    :param mixed_list: The list to be altered.
-    :return: The list in all lowercase.
-    """
-    return [str(element).lower() for element in mixed_list]
-
-
-def scan_file(file, credentials_dict):
-    """
-    Opens file and scans for keywords (username, password, etc).
-    :param file: The path of the file to be scanned.
-    :param credentials_dict: A dictionary with username, password credentials.
-    :return: An updated dictionary inc. the contents from the scanned file.
-    """
+    lines = []
     try:
-        # Open file in 'read' mode
-        with open(file, "r") as f:
-            # Set default username in case a password is the first entry
-            username = "%no_user%"
-            for line in f:
-                if user_pass_flag:
-                    # Line contains any username synonym
-                    if any(i in line.lower() for i in user_syn):
-                        # Extract the keyword from the line
-                        username = extract_kw(line)
-
-                    # Line contains any password synonym
-                    if any(i in line.lower() for i in pass_syn):
-                        # Extract the keyword from the line
-                        password = extract_kw(line)
-
-                        # Username already exists in credentials dictionary
-                        if username in credentials_dict.keys():
-                            # Add the password to the existing username key
-                            credentials_dict[username].append((password, file))
-                        else:
-                            # Add the username, password combo to dictionary
-                            credentials_dict[username] = [(password, file)]
-                        username = "%no_user%"
-
-                # User had added search terms
-                if search_list:
-                    # Cycle through keywords
-                    for keyword in search_list:
-                        # Keyword found in line. Extract
-                        if keyword in line.lower():
-                            word = extract_kw(line)
-
-                            # Create or add word to dictionary
-                            if keyword in credentials_dict.keys():
-                                credentials_dict[keyword].append((word, file))
-                            else:
-                                credentials_dict[keyword] = [(word, file)]
-            return credentials_dict
+        if ext == '.docx':
+            doc = Document(file_path)
+            lines = [para.text for para in doc.paragraphs if para.text.strip()]
+        elif ext == '.odt':
+            doc = ezodf.opendoc(file_path)
+            lines = []
+            for elem in doc.body:
+                text = elem.text
+                text and lines.append(text.strip())
+        elif ext == '.xlsx':
+            wb = openpyxl.load_workbook(file_path, read_only=True)
+            for sheet in wb:
+                for row in sheet.iter_rows(values_only=True):
+                    for cell in row:
+                        if cell is not None and str(cell).strip():
+                            lines.append(str(cell))
+            wb.close()
+        elif ext == '.ods':
+            doc = ezodf.opendoc(file_path)
+            lines = []
+            for sheet in doc.sheets:
+                for row in sheet:
+                    for cell in row:
+                        if cell.value is not None:
+                            value = str(cell.value).strip()
+                            if value:
+                                lines.append(value)
+        else:
+            try:
+                with open(file_path, "r") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                print(f"[*] Unsupported file type: {ext} ({e})")
     # Inadequate permission to access location
     except PermissionError:
         print("[*] Inadequate permissions to access file location")
-    # Could not find path (should never occur since they were enumerated)
+    # Could not find path or invalid file format
     except OSError:
-        print("[*] Unable to find path: {}".format(file))
+        print("[*] Unable to find path or invalid file: {}".format(file_path))
+    except Exception as e:
+        print(f"[*] Unknown error: {e}")
+
+    return lines
+
+
+def scan_file(file, search_parameters: SearchParameters):
+    """
+    Opens file and scans for keywords (username, password, etc). Supports TXT, DOCX, ODT, XLSX, ODS.
+    :param file: The path of the file to be scanned.
+    :param credentials: A list with filename, username, password credentials dicts.
+    :param search_parameters: Search parameters to use.
+    :return: An updated dictionary inc. the contents from the scanned file.
+    """
+    credentials = []
+
+    try:
+        lines = get_lines(file)
+
+        for i, line in enumerate(lines, start=1):
+            username = None
+            password = None
+            other_keyword = None
+
+            if search_parameters.username_pattern:
+                # Line contains any username synonym
+                username_search_res = search_parameters.username_pattern.search(line)
+                if username_search_res:
+                    username = line
+
+            if search_parameters.password_pattern:
+                # Line contains any password synonym
+                password_search_res = search_parameters.password_pattern.search(line)
+                if password_search_res:
+                    password = line
+
+            # User had added search terms
+            if search_parameters.other_keyword_pattern:
+                other_search_res = search_parameters.other_keyword_pattern.search(line)
+                if other_search_res:
+                    other_keyword = other_search_res.group()
+
+            if any([username, password, other_keyword]):
+                credentials.append({
+                    'filename': file,
+                    'line': i,
+                    'username': username,
+                    'password': password,
+                    'other_keyword': other_keyword,
+                })
+
+        return credentials
+    except Exception as e:
+        print("[*] Error processing file {}: {}".format(file, str(e)))
 
 
 def enum_files(folder_path):
@@ -107,84 +149,52 @@ def enum_files(folder_path):
     return f_list
 
 
-def format_credentials(credentials_dict):
-    """
-    Create a list of credentials from the dictionary
-    :param credentials_dict: Final dictionary containing username, passwords...
-    :return Credentials formatted (list)
-    """
-    # List containing all credentials
-    formatted_creds = []
-
-    # Cycle through dictionary
-    for key, value in credentials_dict.items():
-        # Value (list) contains multiple passwords. Each password (tuple)
-        # contains an actual password and the path it was found
-        for password in value:
-            # Format the credential
-            if output_path_flag:
-                cred_combination = "{u}::{p}::{f}".format(u=key, p=password[0],
-                                                          f=password[1])
-            else:
-                cred_combination = "{u}::{p}".format(u=key, p=password[0])
-
-            # Add the formatted credential to the dictionary
-            formatted_creds.append(cred_combination)
-    return formatted_creds
-
-
-def file_output(credentials_list):
+def file_output(file_output_name, credentials):
     """
     Outputs list results to a file
-    :param credentials_list: List containing username, passwords...
+    :param file_output_name: The output file name.
+    :param credentials: List containing username, passwords...
     """
-    if file_output_flag:
-        try:
-            # Open creds file and append
-            with open(file_output_name, "a") as f:
-                # Write to file if list has >0 values
-                if credentials_list:
-                    # Add a new line at end of each value in list
-                    f.writelines("%s\n" % line for line in credentials_list)
-            print("\n[*] File saved under '{f}'".format(f=file_output_name))
-        # Inadequate permission to access location / save to location
-        except PermissionError:
-            print("[*] Error saving log - Permission denied")
-        # Could not find path
-        except OSError:
-            print("[*] Error saving log - Path issues")
+    try:
+        df = pd.DataFrame(credentials)
+        df.to_excel(file_output_name, index=False)
+    except Exception as e:
+        print(f"[*] Error result saving to {file_output_name} - {e}")
 
 
-def main():
+def read_aliases_list_file(file_path):
+    try:
+        with open(file_path, "r") as f:
+            return f.read().split()
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        return []
+
+
+def main(scan_paths: List[Path], search_params: SearchParameters, output_filename: str):
     """
     Main method. Runs credential scanner
     """
-    # Output title card
-    title = TitleGen(text="Credential Scanner", author="Primus27").title
-    print(title)
+    credentials = []
 
-    # Enumerate files in path
-    file_list = enum_files(scan_path)
+    for scan_path in scan_paths:
+        # Enumerate files in path
+        file_list = enum_files(scan_path)
 
-    # Scan each file and add update the credentials dictionary
-    credentials = {}
-    for filename in file_list:
-        credentials = scan_file(filename, credentials)
-
-    # Convert the dictionary into a list ready for output
-    creds_list = format_credentials(credentials)
+        # Scan each file and add update the credentials dictionary
+        for filename in file_list:
+            credentials.extend(scan_file(filename, search_params))
 
     # Print results title
-    print("{n} results found in '{p}':\n".format(n=len(creds_list),
-                                                 p=scan_path))
+    print(f"{len(credentials)} results found:\n")
 
     # Output results to terminal
-    for item in creds_list:
-        print(item)
+    for item in credentials:
+        print(item['filename'], item['line'], item['username'], item['password'], item['other_keyword'])
 
     # Output results to file
-    if file_output_flag:
-        file_output(creds_list)
+    if output_filename:
+        file_output(output_filename, credentials)
 
 
 if __name__ == '__main__':
@@ -198,30 +208,30 @@ if __name__ == '__main__':
     optional = parser.add_argument_group("optional arguments")
 
     # Define arguments
-    required.add_argument("-s", "--scanpath", action="store", default="scan",
-                          dest="scan_path",
-                          help="Scan path (absolute or relative)",
+    required.add_argument("-s", "--scanpath", nargs="*",
+                          action="store", default=[], dest="scan_paths",
+                          help="Scan paths (absolute or relative)",
                           required=True)
-    optional.add_argument("-rm", "--userpass", action="store_false",
-                          dest="user_pass_flag",
-                          help="Disable username & password search")
-    optional.add_argument("-x", "--inclpath", action="store_true",
-                          dest="output_path_flag",
-                          help="Enable path where credential was found")
-    optional.add_argument("-f", "--fileout", action="store_true",
-                          dest="file_output_flag", help="Enable file output")
     optional.add_argument("-n", "--filename", action="store",
-                          default="credentials.txt", dest="file_output_name",
+                          default=f'results_{TODAY.strftime("%Y%m%d_%H%M%S")}.xlsx',
+                          dest="file_output_name",
                           help="Declare a custom filename for file output")
     optional.add_argument("-u", "--username", nargs="*", action="store",
                           default=[], dest="user_syn",
                           help="Add additional username aliases")
+    optional.add_argument("-uf", "--usersfile", action="store", dest="user_syn_file",
+                          help="Add additional username aliases list on file")
     optional.add_argument("-p", "--password", nargs="*", action="store",
                           default=[], dest="pass_syn",
                           help="Add additional password aliases")
+    optional.add_argument("-pf", "--passfile", action="store", dest="pass_syn_file",
+                          help="Add additional password aliases list on file")
     optional.add_argument("-l", "--advanced", nargs="*", action="store",
                           default=[], dest="search_list",
                           help="Add additional search terms")
+    optional.add_argument("-lf", "--advancedfile", action="store",
+                          dest="search_list_file",
+                          help="Add additional search terms list file")
     optional.add_argument("--version", action="version",
                           version="%(prog)s {v}".format(v=current_version),
                           help="Display program version")
@@ -230,33 +240,45 @@ if __name__ == '__main__':
     # Synonyms of username
     user_syn = ["user", "username", "login", "email", "email address", "id"]
     user_syn.extend(args.user_syn)
-    user_syn = list_lower(user_syn)
+
+    if args.user_syn_file:
+        user_syn.extend(read_aliases_list_file(args.user_syn_file))
+
+    username_pattern = re.compile('|'.join(user_syn), flags=re.I)
 
     # Synonyms of password
-    pass_syn = ["pass", "password", "key", "secret", "pin", "passcode",
-                "token"]
+    pass_syn = ["pass", "password", "key", "secret", "pin", "passcode", "token"]
     pass_syn.extend(args.pass_syn)
-    pass_syn = list_lower(pass_syn)
+
+    if args.pass_syn_file:
+        pass_syn.extend(read_aliases_list_file(args.pass_syn_file))
+
+    pass_pattern = re.compile('|'.join(pass_syn), flags=re.I)
 
     # Folder path to scan (Relative (current) or Absolute)
-    scan_path = Path(args.scan_path)
-
-    # Search file for username and password
-    user_pass_flag = args.user_pass_flag
-
-    # Location is output alongside credentials
-    output_path_flag = args.output_path_flag
-
-    # Output results to file
-    file_output_flag = args.file_output_flag
-
-    # Declare custom filename for output file
-    file_output_name = args.file_output_name
+    scan_paths = [Path(p) for p in args.scan_paths]
 
     # Additional search terms
     search_list = []
     search_list.extend(args.search_list)
-    search_list = list_lower(search_list)
+
+    if args.search_list_file:
+        search_list.extend(read_aliases_list_file(args.search_list_file))
+
+    if search_list:
+        other_kw_pattern = re.compile('|'.join(search_list), flags=re.I)
+    else:
+        other_kw_pattern = None
+
+    search_params = SearchParameters(
+        username_pattern=username_pattern,
+        password_pattern=pass_pattern,
+        other_keyword_pattern=other_kw_pattern,
+    )
 
     # Run main method
-    main()
+    main(
+        search_params=search_params,
+        output_filename=args.file_output_name,
+        scan_paths=scan_paths,
+    )
